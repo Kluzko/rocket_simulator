@@ -1,7 +1,7 @@
-use crate::{
-    control::{environment::Environment, rocket::RocketState},
-    utils::vector2d::Vector2D,
-};
+use crate::control::environment::Environment;
+use crate::control::mission::CelestialBody;
+use crate::utils::vector2d::Vector2D;
+use crate::GRAVITATIONAL_CONSTANT;
 
 use super::aerodynamics::Aerodynamics;
 
@@ -11,23 +11,18 @@ pub struct Kinematics {
     pub velocity: Vector2D,
     pub acceleration: Vector2D,
     pub orientation: f64,
-    pub launch_angle: f64,
-    pub launch_site_position: Vector2D,
-    pub time: f64,
+    pub total_mass: f64,
 }
 
-#[allow(dead_code)]
 impl Kinematics {
     pub fn new(launch_angle: f64, launch_site_position: Vector2D) -> Self {
-        let launch_angle_rad = launch_angle.to_radians();
+        println!("Initial position: {:?}", launch_site_position);
         Kinematics {
             position: launch_site_position,
             velocity: Vector2D::new(0.0, 0.0),
             acceleration: Vector2D::new(0.0, 0.0),
-            orientation: launch_angle_rad,
-            launch_angle: launch_angle_rad,
-            launch_site_position,
-            time: 0.0,
+            orientation: launch_angle.to_radians(),
+            total_mass: 0.0, // This should be set after initialization
         }
     }
 
@@ -37,175 +32,92 @@ impl Kinematics {
         thrust_magnitude: f64,
         total_mass: f64,
         aerodynamics: &Aerodynamics,
-        environment: &mut Environment,
+        environment: &Environment,
         orientation_change: f64,
-        rocket_state: &RocketState,
+        celestial_bodies: &[CelestialBody],
     ) {
-        environment.update(self.position.y);
-        self.apply_rotation(orientation_change);
+        self.total_mass = total_mass;
+        self.apply_rotation(orientation_change, delta_time);
 
-        let initial_state = (self.position, self.velocity);
-        let k1 = self.calculate_derivatives(
-            initial_state,
-            thrust_magnitude,
-            total_mass,
-            aerodynamics,
-            environment,
-        );
-        let k2 = self.calculate_derivatives(
-            (
-                initial_state.0 + k1.0 * (delta_time / 2.0),
-                initial_state.1 + k1.1 * (delta_time / 2.0),
-            ),
-            thrust_magnitude,
-            total_mass,
-            aerodynamics,
-            environment,
-        );
-        let k3 = self.calculate_derivatives(
-            (
-                initial_state.0 + k2.0 * (delta_time / 2.0),
-                initial_state.1 + k2.1 * (delta_time / 2.0),
-            ),
-            thrust_magnitude,
-            total_mass,
-            aerodynamics,
-            environment,
-        );
-        let k4 = self.calculate_derivatives(
-            (
-                initial_state.0 + k3.0 * delta_time,
-                initial_state.1 + k3.1 * delta_time,
-            ),
-            thrust_magnitude,
-            total_mass,
-            aerodynamics,
-            environment,
-        );
+        let acceleration = |position: Vector2D, velocity: Vector2D| {
+            let thrust_vector = Vector2D::new(
+                thrust_magnitude * self.orientation.sin(),
+                thrust_magnitude * self.orientation.cos(),
+            );
 
-        self.position =
-            initial_state.0 + (delta_time / 6.0) * (k1.0 + 2.0 * k2.0 + 2.0 * k3.0 + k4.0);
-        self.velocity =
-            initial_state.1 + (delta_time / 6.0) * (k1.1 + 2.0 * k2.1 + 2.0 * k3.1 + k4.1);
+            let gravitational_acceleration =
+                Self::calculate_total_gravity(position, celestial_bodies);
 
-        // Update acceleration for the final state
-        self.acceleration = self.calculate_acceleration(
-            self.velocity,
-            thrust_magnitude,
-            total_mass,
-            aerodynamics,
-            environment,
-        );
+            let aerodynamic_force = if environment.is_in_atmosphere(&position) {
+                aerodynamics.calculate_aerodynamic_force(velocity, self.orientation, environment)
+            } else {
+                Vector2D::new(0.0, 0.0)
+            };
 
-        if matches!(rocket_state, RocketState::Returning) {
-            let ground_threshold = self.launch_site_position.y + 0.1; // 10 cm above ground
-            if self.position.y < ground_threshold && self.velocity.y < 0.0 {
-                self.position.y = self.launch_site_position.y;
-                self.velocity.y = 0.0;
-                println!("Ground collision detected! Exiting simulation.");
-                std::process::exit(0); // Exit after ground collision is detected
-            }
-        }
-
-        // Update time
-        self.time += delta_time;
-
-        // Assertions
-        assert!(
-            self.velocity.magnitude() < 10000.0,
-            "Velocity exceeds reasonable limits"
-        );
-        assert!(total_mass > 0.0, "Total mass must be positive");
-        assert!(
-            self.acceleration.magnitude() < 100.0 * environment.gravity,
-            "Acceleration exceeds reasonable limits"
-        );
-    }
-
-    fn apply_rotation(&mut self, orientation_change: f64) {
-        self.orientation += orientation_change;
-        self.orientation = self.orientation % (2.0 * std::f64::consts::PI);
-        if self.orientation < 0.0 {
-            self.orientation += 2.0 * std::f64::consts::PI;
-        }
-    }
-
-    fn calculate_derivatives(
-        &self,
-        state: (Vector2D, Vector2D),
-        thrust_magnitude: f64,
-        total_mass: f64,
-        aerodynamics: &Aerodynamics,
-        environment: &Environment,
-    ) -> (Vector2D, Vector2D) {
-        let (_position, velocity) = state;
-        let acceleration = self.calculate_acceleration(
-            velocity,
-            thrust_magnitude,
-            total_mass,
-            aerodynamics,
-            environment,
-        );
-        (velocity, acceleration)
-    }
-
-    fn calculate_acceleration(
-        &self,
-        velocity: Vector2D,
-        thrust_magnitude: f64,
-        total_mass: f64,
-        aerodynamics: &Aerodynamics,
-        environment: &Environment,
-    ) -> Vector2D {
-        let thrust_vector = Vector2D::new(
-            thrust_magnitude * self.get_orientation().cos(),
-            thrust_magnitude * self.get_orientation().sin(),
-        );
-
-        // Calculate angle of attack
-        let velocity_angle = if velocity.magnitude() > 1e-6 {
-            velocity.angle()
-        } else {
-            self.get_orientation()
+            let net_force =
+                thrust_vector + (gravitational_acceleration * total_mass) + aerodynamic_force;
+            net_force / total_mass
         };
-        let angle_of_attack = self.get_orientation() - velocity_angle;
 
-        let gravity_vector = Vector2D::new(0.0, -environment.gravity * total_mass);
-        let aerodynamic_force =
-            aerodynamics.calculate_aerodynamic_force(velocity, angle_of_attack, environment);
+        let (new_position, new_velocity) = self.rk4_step(delta_time, acceleration);
 
-        let net_force = thrust_vector + gravity_vector + aerodynamic_force;
-        let acceleration = net_force / total_mass;
-
-        acceleration
+        self.position = new_position;
+        self.velocity = new_velocity;
+        self.acceleration = acceleration(self.position, self.velocity);
     }
 
-    pub fn get_orientation(&self) -> f64 {
-        self.orientation
+    pub fn set_mass(&mut self, new_mass: f64) {
+        self.total_mass = new_mass;
     }
 
-    pub fn get_flight_path(&self) -> Vector2D {
-        self.position - self.launch_site_position
+    fn rk4_step(
+        &self,
+        dt: f64,
+        acceleration: impl Fn(Vector2D, Vector2D) -> Vector2D,
+    ) -> (Vector2D, Vector2D) {
+        let k1v = acceleration(self.position, self.velocity);
+        let k1p = self.velocity;
+
+        let k2v = acceleration(
+            self.position + k1p * (dt / 2.0),
+            self.velocity + k1v * (dt / 2.0),
+        );
+        let k2p = self.velocity + k1v * (dt / 2.0);
+
+        let k3v = acceleration(
+            self.position + k2p * (dt / 2.0),
+            self.velocity + k2v * (dt / 2.0),
+        );
+        let k3p = self.velocity + k2v * (dt / 2.0);
+
+        let k4v = acceleration(self.position + k3p * dt, self.velocity + k3v * dt);
+        let k4p = self.velocity + k3v * dt;
+
+        let new_position = self.position + (k1p + 2.0 * k2p + 2.0 * k3p + k4p) * (dt / 6.0);
+        let new_velocity = self.velocity + (k1v + 2.0 * k2v + 2.0 * k3v + k4v) * (dt / 6.0);
+
+        (new_position, new_velocity)
     }
 
-    pub fn get_launch_angle(&self) -> f64 {
-        self.launch_angle
+    fn calculate_total_gravity(position: Vector2D, celestial_bodies: &[CelestialBody]) -> Vector2D {
+        celestial_bodies
+            .iter()
+            .map(|body| Self::calculate_gravity_from_body(position, body))
+            .sum()
     }
 
-    pub fn get_launch_site_position(&self) -> Vector2D {
-        self.launch_site_position
+    fn calculate_gravity_from_body(position: Vector2D, body: &CelestialBody) -> Vector2D {
+        let r = body.position - position;
+        let r_mag = r.magnitude();
+        if r_mag < 1e-6 {
+            return Vector2D::new(0.0, 0.0);
+        }
+        let g = GRAVITATIONAL_CONSTANT * body.mass / r_mag.powi(2);
+        -r.normalize() * g
     }
 
-    pub fn get_time(&self) -> f64 {
-        self.time
-    }
-
-    pub fn get_altitude(&self) -> f64 {
-        self.position.y - self.launch_site_position.y
-    }
-
-    pub fn get_ground_distance(&self) -> f64 {
-        self.get_flight_path().x
+    pub fn get_altitude(&self, celestial_body: &CelestialBody) -> f64 {
+        self.position.y - celestial_body.radius
     }
 
     pub fn get_velocity_magnitude(&self) -> f64 {
@@ -216,445 +128,204 @@ impl Kinematics {
         self.acceleration.magnitude()
     }
 
-    pub fn get_flight_angle(&self) -> f64 {
-        // Use launch angle if velocity is zero
-        if self.velocity.magnitude() < 1e-6 {
-            self.launch_angle
-        } else {
-            self.velocity.y.atan2(self.velocity.x)
+    pub fn get_orientation(&self) -> f64 {
+        self.orientation
+    }
+
+    pub fn is_orbital_velocity_reached(&self, celestial_body: &CelestialBody) -> bool {
+        let orbital_velocity = self.calculate_orbital_velocity(celestial_body);
+        self.get_velocity_magnitude() >= orbital_velocity
+    }
+
+    pub fn calculate_orbital_velocity(&self, celestial_body: &CelestialBody) -> f64 {
+        let altitude = self.get_altitude(celestial_body);
+        let radius = celestial_body.radius + altitude;
+        let gravity = celestial_body.gravity_at_altitude(altitude);
+
+        (gravity * radius).sqrt()
+    }
+
+    pub fn apply_thrust(&mut self, thrust: f64, delta_time: f64) {
+        let thrust_vector = Vector2D::new(
+            thrust * self.orientation.cos(),
+            thrust * self.orientation.sin(),
+        );
+        let acceleration = thrust_vector / self.total_mass;
+        self.velocity = self.velocity + acceleration * delta_time;
+        self.position = self.position + self.velocity * delta_time;
+    }
+
+    pub fn apply_orientation_change(&mut self, orientation_change: f64) {
+        self.orientation += orientation_change;
+        self.orientation %= 2.0 * std::f64::consts::PI;
+        if self.orientation < 0.0 {
+            self.orientation += 2.0 * std::f64::consts::PI;
+        }
+    }
+
+    fn apply_rotation(&mut self, orientation_change: f64, delta_time: f64) {
+        let max_rotation_rate = 0.1; // radians per second
+        let clamped_change = orientation_change.clamp(
+            -max_rotation_rate * delta_time,
+            max_rotation_rate * delta_time,
+        );
+        self.orientation += clamped_change;
+        self.orientation %= 2.0 * std::f64::consts::PI;
+        if self.orientation < 0.0 {
+            self.orientation += 2.0 * std::f64::consts::PI;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use approx::assert_relative_eq;
     use std::f64::consts::PI;
 
-    // FIX LATER ROCKET STATE NOW FOR SIMPILICTY WE ADD EVRYWHERE LAUNCHED
+    fn create_earth() -> CelestialBody {
+        CelestialBody::new(
+            "Earth".to_string(),
+            Vector2D::new(0.0, 0.0),
+            6_371_000.0,
+            5.97e24,
+        )
+    }
 
-    fn create_test_aerodynamics() -> Aerodynamics {
-        Aerodynamics::new(0.5, 10.0, 0.1)
+    fn create_mock_environment() -> Environment {
+        Environment::new(create_earth())
+    }
+
+    fn create_mock_aerodynamics() -> Aerodynamics {
+        Aerodynamics::new(0.5, 10.0, 0.3)
     }
 
     #[test]
-    fn test_kinematics_initial_state() {
-        let kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 100.0));
-        assert_eq!(kinematics.position, Vector2D::new(0.0, 100.0));
-        assert_eq!(kinematics.velocity, Vector2D::new(0.0, 0.0));
-        assert_eq!(kinematics.acceleration, Vector2D::new(0.0, 0.0));
+    fn test_kinematics_initialization() {
+        let launch_angle = 90.0; // Straight up
+        let earth = create_earth();
+        let launch_site = Vector2D::new(0.0, earth.radius);
+        let kinematics = Kinematics::new(launch_angle, launch_site);
+
+        assert_relative_eq!(kinematics.position.x, 0.0, epsilon = 1e-6);
+        assert_relative_eq!(kinematics.position.y, earth.radius, epsilon = 1e-6);
+        assert_relative_eq!(kinematics.velocity.x, 0.0, epsilon = 1e-6);
+        assert_relative_eq!(kinematics.velocity.y, 0.0, epsilon = 1e-6);
+        assert_relative_eq!(kinematics.acceleration.x, 0.0, epsilon = 1e-6);
+        assert_relative_eq!(kinematics.acceleration.y, 0.0, epsilon = 1e-6);
+        assert_relative_eq!(kinematics.orientation, PI / 2.0, epsilon = 1e-6);
     }
 
     #[test]
-    fn test_kinematics_gravity_effect() {
-        let mut kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 0.0));
-        let mut environment = Environment::new();
-        let aerodynamics = create_test_aerodynamics();
-        let delta_time = 0.1;
-        let mass = 1000.0;
+    fn test_kinematics_update_vertical_launch() {
+        let mut kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 6_371_000.0));
+        let earth = create_earth();
+        let environment = create_mock_environment();
+        let aerodynamics = create_mock_aerodynamics();
 
-        // Set initial position to 100 meters above launch site
-        kinematics.position.y = 100.0;
+        let thrust = 1_000_000.0; // 1 MN thrust
+        let total_mass = 100_000.0; // 100 tonnes
+        let delta_time = 1.0; // 1 second
 
-        // Apply gravity for one step
-        kinematics.update(
-            delta_time,
-            0.0,
-            mass,
-            &aerodynamics,
-            &mut environment,
-            0.0,
-            &RocketState::Launched,
-        );
-
-        println!(
-            "After first update: velocity = {}, altitude = {}",
-            kinematics.velocity.y,
-            kinematics.get_altitude()
-        );
-
-        assert!(
-            kinematics.velocity.y < -0.9,
-            "Rocket should start falling. Velocity y: {}",
-            kinematics.velocity.y
-        );
-        assert!(
-            kinematics.get_altitude() < 100.0 && kinematics.get_altitude() > 99.9,
-            "Rocket should lose a small amount of altitude. Altitude: {}",
-            kinematics.get_altitude()
-        );
-
-        // Continue simulation for a few more steps
-        for i in 0..9 {
-            kinematics.update(
-                delta_time,
-                0.0,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                0.0,
-                &RocketState::Launched,
-            );
-            println!(
-                "Step {}: velocity = {}, altitude = {}",
-                i + 2,
-                kinematics.velocity.y,
-                kinematics.get_altitude()
-            );
-        }
-
-        assert!(
-            kinematics.velocity.y < -9.5,
-            "Rocket should be falling faster. Velocity y: {}",
-            kinematics.velocity.y
-        );
-        assert!(
-            kinematics.get_altitude() < 96.0 && kinematics.get_altitude() > 95.0,
-            "Rocket should have lost significant altitude. Altitude: {}",
-            kinematics.get_altitude()
-        );
-    }
-
-    #[test]
-    fn test_kinematics_with_thrust() {
-        let mut kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 0.0));
-        let mut environment = Environment::new();
-        let aerodynamics = create_test_aerodynamics();
-        let delta_time = 0.1;
-        let mass = 1000.0;
-        let thrust = 15000.0; // Thrust greater than gravity * mass
-
-        for _ in 0..10 {
-            kinematics.update(
-                delta_time,
-                thrust,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                0.0,
-                &RocketState::Launched,
-            );
-        }
-
-        assert!(
-            kinematics.position.y > 0.0,
-            "Rocket should gain altitude with thrust. Position y: {}",
-            kinematics.position.y
-        );
-        assert!(
-            kinematics.velocity.y > 0.0,
-            "Rocket should have positive vertical velocity. Velocity y: {}",
-            kinematics.velocity.y
-        );
-    }
-
-    #[test]
-    fn test_kinematics_angled_launch() {
-        let launch_angle = 60.0; // 60 degree launch angle
-        let mut kinematics = Kinematics::new(launch_angle, Vector2D::new(0.0, 0.0));
-        let mut environment = Environment::new();
-        let aerodynamics = create_test_aerodynamics();
-        let delta_time = 0.1;
-        let mass = 1000.0;
-        let thrust = 15000.0;
-
-        for _ in 0..10 {
-            kinematics.update(
-                delta_time,
-                thrust,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                0.0,
-                &RocketState::Launched,
-            );
-        }
-
-        assert!(
-            kinematics.position.y > 0.0,
-            "Rocket should gain altitude. Position y: {}",
-            kinematics.position.y
-        );
-        assert!(
-            kinematics.position.x > 0.0,
-            "Rocket should have horizontal displacement. Position x: {}",
-            kinematics.position.x
-        );
-        assert!(
-            kinematics.velocity.y > 0.0,
-            "Rocket should have positive vertical velocity. Velocity y: {}",
-            kinematics.velocity.y
-        );
-        assert!(
-            kinematics.velocity.x > 0.0,
-            "Rocket should have positive horizontal velocity. Velocity x: {}",
-            kinematics.velocity.x
-        );
-    }
-
-    #[test]
-    fn test_kinematics_pitch_over() {
-        let mut kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 0.0));
-        let mut environment = Environment::new();
-        let aerodynamics = create_test_aerodynamics();
-        let delta_time = 0.1;
-        let mass = 1000.0;
-        let thrust = 15000.0;
-        let orientation_change = -0.01;
-
-        // Simulate for 10 seconds (100 steps)
-        for _ in 0..100 {
-            kinematics.update(
-                delta_time,
-                thrust,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                orientation_change,
-                &RocketState::Launched,
-            );
-        }
-
-        // Check if the rocket has gained both vertical and horizontal velocity
-        assert!(
-            kinematics.velocity.y > 0.0,
-            "Rocket should have positive vertical velocity. Velocity y: {}",
-            kinematics.velocity.y
-        );
-        assert!(
-            kinematics.velocity.x > 0.0,
-            "Rocket should have positive horizontal velocity due to pitch over. Velocity x: {}",
-            kinematics.velocity.x
-        );
-
-        // Check if the rocket has moved both vertically and horizontally
-        assert!(
-            kinematics.position.y > 0.0,
-            "Rocket should gain altitude. Position y: {}",
-            kinematics.position.y
-        );
-        assert!(
-            kinematics.position.x > 0.0,
-            "Rocket should have horizontal displacement due to pitch over. Position x: {}",
-            kinematics.position.x
-        );
-
-        assert!(
-            kinematics.orientation < PI / 2.0,
-            "Rocket orientation should have decreased due to pitch over. Orientation: {}",
-            kinematics.orientation
-        );
-    }
-
-    #[test]
-    fn test_kinematics_thrust_cutoff() {
-        let mut kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 0.0));
-        let mut environment = Environment::new();
-        let aerodynamics = create_test_aerodynamics();
-        let delta_time = 0.1;
-        let mass = 1000.0;
-        let thrust = 15000.0;
-
-        // Apply thrust for 5 steps
-        for _ in 0..5 {
-            kinematics.update(
-                delta_time,
-                thrust,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                0.0,
-                &RocketState::Launched,
-            );
-        }
-
-        let peak_altitude = kinematics.position.y;
-        let peak_velocity = kinematics.velocity.y;
-
-        println!("Peak altitude: {}", peak_altitude);
-        println!("Peak velocity: {}", peak_velocity);
-
-        for i in 0..10 {
-            kinematics.update(
-                delta_time,
-                0.0,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                0.0,
-                &RocketState::Launched,
-            );
-            println!(
-                "Step {}: altitude = {}, velocity = {}",
-                i + 1,
-                kinematics.position.y,
-                kinematics.velocity.y
-            );
-        }
-
-        assert!(
-            kinematics.position.y < peak_altitude,
-            "Rocket should fall after thrust cutoff. Current altitude: {}, Peak altitude: {}",
-            kinematics.position.y,
-            peak_altitude
-        );
-        assert!(
-               kinematics.velocity.y < peak_velocity,
-               "Rocket's vertical velocity should decrease after thrust cutoff. Current velocity: {}, Peak velocity: {}",
-               kinematics.velocity.y,
-               peak_velocity
-           );
-    }
-
-    #[test]
-    fn test_kinematics_thrust_cutoff_with_environment() {
-        let mut kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 0.0));
-        let mut environment = Environment::new();
-        let aerodynamics = create_test_aerodynamics();
-        let delta_time = 0.1;
-        let mass = 1000.0;
-        let thrust = 15000.0;
-
-        // Apply thrust for 50 steps
-        for _ in 0..50 {
-            kinematics.update(
-                delta_time,
-                thrust,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                0.0,
-                &RocketState::Launched,
-            );
-        }
-
-        let peak_velocity = kinematics.velocity.y;
-        let initial_position = kinematics.position.y;
-
-        println!("Initial position after thrust: {}", initial_position);
-        println!("Peak velocity: {}", peak_velocity);
-
-        // Continue without thrust for 100 more steps
-        for i in 0..100 {
-            kinematics.update(
-                delta_time,
-                0.0,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                0.0,
-                &RocketState::Launched,
-            );
-            if i % 10 == 0 {
-                println!(
-                    "Step {}: altitude = {}, velocity = {}, gravity = {}",
-                    i + 1,
-                    kinematics.position.y,
-                    kinematics.velocity.y,
-                    environment.gravity
-                );
-            }
-        }
-
-        assert!(
-                kinematics.velocity.y < peak_velocity,
-                "Rocket's vertical velocity should decrease. Initial velocity: {}, Current velocity: {}",
-                peak_velocity,
-                kinematics.velocity.y
-            );
-
-        // The rocket may still be gaining altitude due to its momentum,
-        // but its rate of ascent should be decreasing
-        let altitude_gain_rate = (kinematics.position.y - initial_position) / (100.0 * delta_time);
-        assert!(
-            altitude_gain_rate < peak_velocity,
-            "Rate of altitude gain should decrease. Initial velocity: {}, Current rate: {}",
-            peak_velocity,
-            altitude_gain_rate
-        );
-    }
-
-    #[test]
-    fn test_kinematics_orientation_change() {
-        let mut kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 0.0));
-        let mut environment = Environment::new();
-        let aerodynamics = create_test_aerodynamics();
-        let delta_time = 0.1;
-        let mass = 1000.0;
-        let thrust = 15000.0;
-        let orientation_change = 0.1;
-
-        let initial_orientation = kinematics.orientation;
-
-        // Apply 10 updates with orientation change
-        for _ in 0..10 {
-            kinematics.update(
-                delta_time,
-                thrust,
-                mass,
-                &aerodynamics,
-                &mut environment,
-                orientation_change,
-                &RocketState::Launched,
-            );
-        }
-
-        assert!(
-            kinematics.orientation > initial_orientation,
-            "Rocket orientation should have increased. Initial: {}, Current: {}",
-            initial_orientation,
-            kinematics.orientation
-        );
-
-        assert_relative_eq!(
-            kinematics.orientation,
-            initial_orientation + 10.0 * orientation_change,
-            epsilon = 1e-6
-        );
-
-        // Verify that orientation stays within [0, 2π]
-        assert!(kinematics.orientation >= 0.0 && kinematics.orientation < 2.0 * PI);
-    }
-
-    #[test]
-    fn test_gravity_decreases_with_altitude_during_flight() {
-        let mut environment = Environment::new();
-        let mut kinematics = Kinematics::new(90.0, Vector2D::new(0.0, 0.0));
-        let aerodynamics = create_test_aerodynamics();
-        let delta_time = 0.1;
-        let mass = 1000.0;
-        let thrust = 0.0;
-
-        // Initial gravity at sea level
         kinematics.update(
             delta_time,
             thrust,
-            mass,
+            total_mass,
             &aerodynamics,
-            &mut environment,
+            &environment,
             0.0,
-            &RocketState::Launched,
+            &[earth],
         );
-        let sea_level_gravity = environment.gravity;
 
-        // Simulate rocket reaching 10,000 meters
-        kinematics.position.y = 10_000.0;
+        // The rocket should move upwards
+        assert!(
+            kinematics.position.y > 6_371_000.0,
+            "Rocket should move upwards"
+        );
+        assert!(
+            kinematics.velocity.y > 0.0,
+            "Rocket should have upward velocity"
+        );
+    }
+
+    #[test]
+    fn test_kinematics_update_angled_launch() {
+        let mut kinematics = Kinematics::new(80.0, Vector2D::new(0.0, 6_371_000.0));
+        let earth = create_earth();
+        let environment = create_mock_environment();
+        let aerodynamics = create_mock_aerodynamics();
+
+        let thrust = 1_000_000.0;
+        let total_mass = 100_000.0;
+        let delta_time = 1.0;
+
         kinematics.update(
             delta_time,
             thrust,
-            mass,
+            total_mass,
             &aerodynamics,
-            &mut environment,
+            &environment,
             0.0,
-            &RocketState::Launched,
+            &[earth],
         );
-        let high_altitude_gravity = environment.gravity;
 
-        // Ensure that gravity decreases as altitude increases
+        // The rocket should move upwards and slightly to the side
         assert!(
-            high_altitude_gravity < sea_level_gravity,
-            "Gravity should decrease at higher altitudes"
+            kinematics.position.y > 6_371_000.0,
+            "Rocket should move upwards"
         );
+        assert!(kinematics.position.x > 0.0, "Rocket should move sideways");
+        assert!(
+            kinematics.velocity.y > 0.0,
+            "Rocket should have upward velocity"
+        );
+        assert!(
+            kinematics.velocity.x > 0.0,
+            "Rocket should have sideways velocity"
+        );
+    }
+
+    #[test]
+    fn test_get_altitude() {
+        let earth = create_earth();
+        let kinematics = Kinematics::new(90.0, Vector2D::new(0.0, earth.radius + 1000.0));
+
+        let altitude = kinematics.get_altitude(&earth);
+        assert_relative_eq!(altitude, 1000.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_calculate_orbital_velocity() {
+        let earth = create_earth();
+        let kinematics = Kinematics::new(0.0, Vector2D::new(0.0, earth.radius + 200_000.0));
+
+        let orbital_velocity = kinematics.calculate_orbital_velocity(&earth);
+
+        // Expected orbital velocity at 200 km altitude
+        let expected_velocity = 7784.0; // m/s (approximate)
+        assert_relative_eq!(orbital_velocity, expected_velocity, epsilon = 10.0);
+    }
+
+    #[test]
+    fn test_apply_rotation() {
+        let mut kinematics = Kinematics::new(0.0, Vector2D::new(0.0, 6_371_000.0));
+        let delta_time = 1.0;
+        let rotation_change = 0.2; // radians
+
+        kinematics.apply_rotation(rotation_change, delta_time);
+
+        assert_relative_eq!(kinematics.orientation, 0.1, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_gravity_calculation() {
+        let earth = create_earth();
+        let position = Vector2D::new(0.0, earth.radius);
+        let gravity = Kinematics::calculate_gravity_from_body(position, &earth);
+
+        let expected_gravity = Vector2D::new(0.0, 9.81);
+        assert_relative_eq!(gravity.x, expected_gravity.x, epsilon = 0.01);
+        assert_relative_eq!(gravity.y, expected_gravity.y, epsilon = 0.01);
     }
 }

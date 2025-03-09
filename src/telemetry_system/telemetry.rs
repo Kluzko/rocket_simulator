@@ -8,6 +8,7 @@ pub struct Telemetry {
     min_fuel: f64,
     max_acceleration: f64,
     state_times: Vec<(RocketState, f64)>,
+    simulation_time: f64,
 }
 
 impl Telemetry {
@@ -19,6 +20,7 @@ impl Telemetry {
             min_fuel: f64::MAX,
             max_acceleration: 0.0,
             state_times: Vec::new(),
+            simulation_time: 0.0,
         }
     }
 
@@ -54,15 +56,14 @@ impl Telemetry {
         }
     }
 
-    pub fn collect_data(&mut self, rocket: &Rocket) {
+    pub fn collect_data(&mut self, rocket: &Rocket, delta_time: f64) {
+        self.simulation_time += delta_time;
         let velocity_magnitude = rocket.kinematics.get_velocity_magnitude();
-        let altitude = rocket.kinematics.get_altitude();
+        let altitude = rocket
+            .kinematics
+            .get_altitude(&rocket.mission.start_body.clone());
         let acceleration_magnitude = rocket.kinematics.get_acceleration_magnitude();
-        let fuel = rocket
-            .structure
-            .stages
-            .first()
-            .map_or(0.0, |stage| stage.propulsion.fuel_mass);
+        let fuel = rocket.structure.get_total_fuel();
 
         // Update key metrics
         if velocity_magnitude > self.max_velocity {
@@ -78,20 +79,18 @@ impl Telemetry {
             self.max_acceleration = acceleration_magnitude;
         }
 
-        // Log data with human-readable time
-        let elapsed_time = rocket.kinematics.get_time();
-        let formatted_time = Self::format_time(elapsed_time);
+        let formatted_time = Self::format_time(self.simulation_time);
         let data = format!(
             "Time: {}\n\
-               Position: {}\n\
-               Velocity: {} (Magnitude: {:.2} m/s)\n\
-               Acceleration: {} (Magnitude: {:.2} m/s²)\n\
-               Thrust: {:.2} N\n\
-               Fuel: {:.2} kg\n\
-               Air Density: {:.4} kg/m³\n\
-               Gravity: {:.4} m/s²\n\
-               Total Mass: {:.2} kg\n\
-               Orientation: {:.2}°\n",
+                 Position: {}\n\
+                 Velocity: {} (Magnitude: {:.2} m/s)\n\
+                 Acceleration: {} (Magnitude: {:.2} m/s²)\n\
+                 Thrust: {:.2} N\n\
+                 Fuel: {:.2} kg\n\
+                 Air Density: {:.4} kg/m³\n\
+                 Gravity: {:.4} m/s²\n\
+                 Total Mass: {:.2} kg\n\
+                 Orientation: {:.2}°\n",
             formatted_time,
             Self::format_vector2d(&rocket.kinematics.position, 2),
             Self::format_vector2d(&rocket.kinematics.velocity, 2),
@@ -114,10 +113,12 @@ impl Telemetry {
         // Track state transitions
         if let Some((last_state, _)) = self.state_times.last() {
             if *last_state != rocket.state {
-                self.state_times.push((rocket.state.clone(), elapsed_time));
+                self.state_times
+                    .push((rocket.state.clone(), self.simulation_time));
             }
         } else {
-            self.state_times.push((rocket.state.clone(), elapsed_time));
+            self.state_times
+                .push((rocket.state.clone(), self.simulation_time));
         }
     }
 
@@ -128,14 +129,12 @@ impl Telemetry {
         }
         println!("--- End of Telemetry ---");
 
-        // Display the summary of key metrics
         println!("\n--- Simulation Summary ---");
         println!("Max Velocity: {:.2} m/s", self.max_velocity);
         println!("Max Altitude: {}", Self::format_altitude(self.max_altitude));
         println!("Min Fuel: {:.2} kg", self.min_fuel);
         println!("Max Acceleration: {:.2} m/s²", self.max_acceleration);
 
-        // Display state transitions with formatted times
         println!("\n--- State Transitions ---");
         for (state, time) in &self.state_times {
             println!("State {:?} reached at: {}", state, Self::format_time(*time));

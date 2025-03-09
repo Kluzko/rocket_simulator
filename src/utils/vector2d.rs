@@ -1,3 +1,4 @@
+use std::iter::Sum;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,6 +31,12 @@ impl Vector2D {
 
     pub fn angle(&self) -> f64 {
         self.y.atan2(self.x)
+    }
+}
+
+impl Sum for Vector2D {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Vector2D::new(0.0, 0.0), |a, b| a + b)
     }
 }
 

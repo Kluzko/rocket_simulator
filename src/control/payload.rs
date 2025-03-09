@@ -1,3 +1,4 @@
+#[derive(Clone)]
 pub struct Payload {
     pub mass: f64, // kg
     pub deployed: bool,
@@ -41,39 +42,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_payload() {
-        let payload = Payload::new(100.0, 1000.0);
-        assert_eq!(payload.mass, 100.0);
-        assert_eq!(payload.deployment_altitude, 1000.0);
-        assert_eq!(payload.deployed, false);
+    fn test_payload_initialization() {
+        let payload = Payload::new(1000.0, 200_000.0);
+
+        assert_eq!(payload.mass, 1000.0);
+        assert_eq!(payload.deployment_altitude, 200_000.0);
+        assert!(!payload.deployed); // Payload should not be deployed initially
     }
 
     #[test]
-    fn test_check_deployment() {
-        let mut payload = Payload::new(100.0, 1000.0);
+    fn test_payload_deployment() {
+        let mut payload = Payload::new(500.0, 150_000.0);
 
-        payload.check_deployment(500.0);
-        assert_eq!(payload.deployed, false);
+        // Test at lower altitude, deployment should not happen
+        payload.check_deployment(100_000.0);
+        assert!(!payload.is_deployed());
 
-        payload.check_deployment(1000.0);
-        assert_eq!(payload.deployed, true);
+        // Test at altitude higher than deployment altitude
+        payload.check_deployment(160_000.0);
+        assert!(payload.is_deployed()); // Payload should be deployed now
     }
 
     #[test]
-    fn test_get_mass() {
-        let mut payload = Payload::new(100.0, 1000.0);
-        assert_eq!(payload.get_mass(), 100.0);
+    fn test_payload_mass_before_and_after_deployment() {
+        let mut payload = Payload::new(800.0, 120_000.0);
 
-        payload.check_deployment(1000.0);
-        assert_eq!(payload.get_mass(), 0.0);
+        // Check mass before deployment
+        assert_eq!(payload.get_mass(), 800.0);
+
+        // Deploy the payload at the right altitude
+        payload.check_deployment(130_000.0);
+        assert!(payload.is_deployed());
+
+        // Check mass after deployment
+        assert_eq!(payload.get_mass(), 0.0); // Should return 0 after deployment
     }
 
     #[test]
-    fn test_is_deployed() {
-        let mut payload = Payload::new(100.0, 1000.0);
-        assert_eq!(payload.is_deployed(), false);
+    fn test_payload_deployment_exact_altitude() {
+        let mut payload = Payload::new(750.0, 100_000.0);
 
-        payload.check_deployment(1000.0);
-        assert_eq!(payload.is_deployed(), true);
+        // Deploy the payload exactly at the deployment altitude
+        payload.check_deployment(100_000.0);
+        assert!(payload.is_deployed());
+    }
+
+    #[test]
+    fn test_payload_no_deployment_below_altitude() {
+        let mut payload = Payload::new(750.0, 200_000.0);
+
+        // Check at altitude below deployment
+        payload.check_deployment(199_000.0);
+        assert!(!payload.is_deployed());
     }
 }

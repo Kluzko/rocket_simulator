@@ -3,6 +3,15 @@ name = "rocket_sim"
 version = "0.1.0"
 edition = "2021"
 
+
+[lib]
+name = "rocket_simulation"
+path = "src/lib.rs"
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
+
 [dependencies]
 # rapier2d = "0.13.0"
 # ggez = "0.7.0"

@@ -1,6 +1,8 @@
 pub mod environment;
+pub mod fuel_managment;
 pub mod guidance;
 pub mod launch_stages;
+pub mod mission;
 pub mod payload;
 pub mod propulsion;
 pub mod rocket;
