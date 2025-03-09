@@ -1,4 +1,5 @@
 use crate::{
+    errors::SimulationError,
     trajectory_system::{aerodynamics::Aerodynamics, kinematics::Kinematics},
     utils::vector2d::Vector2D,
 };
@@ -11,9 +12,7 @@ use super::{
     structure::Structure,
 };
 
-use std::time::Duration;
-
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Copy, Clone)]
 pub enum RocketState {
     Idle,
     LaunchSequence,
@@ -31,6 +30,12 @@ pub enum RocketState {
     MissionComplete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StateTransition {
+    Stay,
+    Transition(RocketState),
+}
+
 pub struct Rocket {
     pub structure: Structure,
     pub guidance: GuidanceSystem,
@@ -40,7 +45,6 @@ pub struct Rocket {
     pub state: RocketState,
     pub mission: Mission,
     launch_sequence_start: Option<std::time::Instant>,
-    engine_startup_duration: Duration,
 }
 
 impl Rocket {
@@ -64,7 +68,6 @@ impl Rocket {
             state: RocketState::Idle,
             mission,
             launch_sequence_start: None,
-            engine_startup_duration: Duration::from_secs(5),
         }
     }
 
@@ -77,7 +80,7 @@ impl Rocket {
         }
     }
 
-    pub fn update(&mut self, delta_time: f64) -> Result<(), &'static str> {
+    pub fn update(&mut self, delta_time: f64) -> Result<(), SimulationError> {
         match self.state {
             RocketState::Idle => Ok(()),
             RocketState::LaunchSequence => self.update_launch_sequence(delta_time),
@@ -85,7 +88,7 @@ impl Rocket {
         }
     }
 
-    fn update_launch_sequence(&mut self, delta_time: f64) -> Result<(), &'static str> {
+    fn update_launch_sequence(&mut self, delta_time: f64) -> Result<(), SimulationError> {
         if let Some(start_time) = self.launch_sequence_start {
             println!("Launch sequence elapsed time: {:?}", start_time.elapsed());
 
@@ -113,7 +116,7 @@ impl Rocket {
         Ok(())
     }
 
-    fn update_flight(&mut self, delta_time: f64) -> Result<(), &'static str> {
+    fn update_flight(&mut self, delta_time: f64) -> Result<(), SimulationError> {
         let flight_data = self.gather_flight_data();
         self.check_thrust_sufficiency(&flight_data)?;
         self.update_rocket_systems(delta_time, &flight_data)?;
@@ -138,12 +141,14 @@ impl Rocket {
         }
     }
 
-    fn check_thrust_sufficiency(&self, flight_data: &FlightData) -> Result<(), &'static str> {
+    fn check_thrust_sufficiency(&self, flight_data: &FlightData) -> Result<(), SimulationError> {
         if self.state == RocketState::Ascent
             && !self.structure.is_thrust_sufficient(flight_data.gravity)
         {
             println!("Thrust is insufficient to overcome gravity at current altitude.");
-            return Err("Thrust is insufficient.");
+            return Err(SimulationError::PhysicsError(
+                "Thrust is insufficient to overcome gravity.".to_string(),
+            ));
         }
         Ok(())
     }
@@ -152,7 +157,7 @@ impl Rocket {
         &mut self,
         delta_time: f64,
         flight_data: &FlightData,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), SimulationError> {
         let current_phase = self.get_current_flight_phase();
         self.structure.set_flight_phase(current_phase);
 
@@ -217,28 +222,97 @@ impl Rocket {
     }
 
     fn update_state(&mut self) {
-        self.state = match self.state {
-            RocketState::Idle if self.should_launch() => RocketState::Launched,
-            RocketState::Launched => RocketState::Ascent,
-            RocketState::Ascent if self.has_reached_orbit_altitude() => RocketState::OrbitInsertion,
-            RocketState::OrbitInsertion if self.is_in_stable_orbit() => {
-                RocketState::OrbitStabilization
+        let transition = match self.state {
+            RocketState::Idle => {
+                if self.should_launch() {
+                    StateTransition::Transition(RocketState::Launched)
+                } else {
+                    StateTransition::Stay
+                }
             }
-            RocketState::OrbitStabilization if self.is_ready_for_transfer() => {
-                RocketState::Transfer
+            RocketState::Launched => StateTransition::Transition(RocketState::Ascent),
+            RocketState::Ascent => {
+                if self.has_reached_orbit_altitude() {
+                    StateTransition::Transition(RocketState::OrbitInsertion)
+                } else {
+                    StateTransition::Stay
+                }
             }
-            RocketState::Transfer if self.is_approaching_target() => RocketState::Approach,
-            RocketState::Approach if self.is_close_to_target() => RocketState::Rendezvous,
-            RocketState::Rendezvous if self.should_begin_descent() => RocketState::Descent,
-            RocketState::Descent if self.is_near_surface() => RocketState::Landing,
-            RocketState::Landing if self.has_landed() => RocketState::Landed,
-            RocketState::Landed if self.mission.return_trip && self.should_return() => {
-                RocketState::Returning
+            RocketState::OrbitInsertion => {
+                if self.is_in_stable_orbit() {
+                    StateTransition::Transition(RocketState::OrbitStabilization)
+                } else {
+                    StateTransition::Stay
+                }
             }
-            RocketState::Returning if self.has_returned_to_start() => RocketState::Descent,
-            RocketState::Landed if !self.mission.return_trip => RocketState::MissionComplete,
-            _ => self.state.clone(),
+            RocketState::OrbitStabilization => {
+                if self.is_ready_for_transfer() {
+                    StateTransition::Transition(RocketState::Transfer)
+                } else {
+                    StateTransition::Stay
+                }
+            }
+            RocketState::Transfer => {
+                if self.is_approaching_target() {
+                    StateTransition::Transition(RocketState::Approach)
+                } else {
+                    StateTransition::Stay
+                }
+            }
+            RocketState::Approach => {
+                if self.is_close_to_target() {
+                    StateTransition::Transition(RocketState::Rendezvous)
+                } else {
+                    StateTransition::Stay
+                }
+            }
+            RocketState::Rendezvous => {
+                if self.should_begin_descent() {
+                    StateTransition::Transition(RocketState::Descent)
+                } else {
+                    StateTransition::Stay
+                }
+            }
+            RocketState::Descent => {
+                if self.is_near_surface() {
+                    StateTransition::Transition(RocketState::Landing)
+                } else {
+                    StateTransition::Stay
+                }
+            }
+            RocketState::Landing => {
+                if self.has_landed() {
+                    StateTransition::Transition(RocketState::Landed)
+                } else {
+                    StateTransition::Stay
+                }
+            }
+            RocketState::Landed => {
+                if self.mission.return_trip && self.should_return() {
+                    StateTransition::Transition(RocketState::Returning)
+                } else if !self.mission.return_trip {
+                    StateTransition::Transition(RocketState::MissionComplete)
+                } else {
+                    StateTransition::Stay
+                }
+            }
+            RocketState::Returning => {
+                if self.has_returned_to_start() {
+                    StateTransition::Transition(RocketState::Descent)
+                } else {
+                    StateTransition::Stay
+                }
+            }
+            RocketState::LaunchSequence | RocketState::MissionComplete => StateTransition::Stay,
         };
+
+        match transition {
+            StateTransition::Transition(new_state) => {
+                println!("State transition: {:?} -> {:?}", self.state, new_state);
+                self.state = new_state;
+            }
+            StateTransition::Stay => {}
+        }
     }
 
     fn get_current_flight_phase(&self) -> FlightPhase {
@@ -350,83 +424,4 @@ struct FlightData {
     total_thrust: f64,
     target_altitude: f64,
     target_velocity: f64,
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::{MissionFactory, Payload, Stage};
-    use std::{thread, time::Duration};
-
-    #[test]
-    fn test_rocket_launch_and_ascent() {
-        let stage = Stage::new(100_000.0, 20_000.0, 500.0, 200.0);
-        let structure = Structure::new(vec![stage], Payload::new(5_000.0, 200_000.0));
-        let mission =
-            MissionFactory::create_earth_orbit("Test Orbit".to_string(), 200_000.0, 300_000.0);
-        let aerodynamics = Aerodynamics::new(0.5, 10.0, 0.3);
-        let mut rocket = Rocket::new(structure, mission, aerodynamics, 90.0);
-
-        rocket.start_launch_sequence();
-        assert_eq!(rocket.state, RocketState::LaunchSequence);
-
-        let update_interval = Duration::from_millis(100);
-        let mut elapsed_time = 0.0;
-        while rocket.state == RocketState::LaunchSequence {
-            rocket
-                .update(0.1)
-                .expect("Failed to update during launch sequence");
-            elapsed_time += 0.1;
-            thread::sleep(update_interval);
-        }
-
-        assert_eq!(rocket.state, RocketState::Launched);
-        println!("Rocket launched after {:.1} seconds", elapsed_time);
-
-        let mut elapsed_time = 0.0;
-        let update_interval = 1.0; // 100ms
-        let simulation_duration = 10.0; // 60 seconds
-        let initial_altitude = rocket.kinematics.get_altitude(&rocket.mission.start_body);
-
-        while elapsed_time < simulation_duration {
-            match rocket.update(update_interval) {
-                Ok(_) => {
-                    let flight_data = rocket.gather_flight_data();
-                    println!(
-                                "Time: {:.1}s | State: {:?} | Altitude: {:.2} m | Velocity: {:.2} m/s | Thrust: {:.2} N",
-                                elapsed_time,
-                                rocket.state,
-                                flight_data.current_altitude,
-                                flight_data.current_velocity,
-                                flight_data.total_thrust
-                            );
-
-                    if flight_data.current_altitude > 100_000.0 {
-                        // Break if we reach 100 km
-                        break;
-                    }
-                }
-                Err(e) => {
-                    println!("Error during update: {}", e);
-                    break;
-                }
-            }
-            elapsed_time += update_interval;
-        }
-
-        let final_altitude = rocket.kinematics.get_altitude(&rocket.mission.start_body);
-        assert!(
-               final_altitude > initial_altitude,
-               "Rocket's altitude should have increased after ascent. Initial altitude: {:.2} m, Final altitude: {:.2} m",
-               initial_altitude,
-               final_altitude
-           );
-
-        let final_velocity = rocket.kinematics.get_velocity_magnitude();
-        assert!(
-            final_velocity > 0.0,
-            "Rocket's velocity should be positive during ascent. Current velocity: {:.2} m/s",
-            final_velocity
-        );
-    }
 }

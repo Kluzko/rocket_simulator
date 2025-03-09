@@ -28,22 +28,43 @@ impl Aerodynamics {
         lift_vector + drag_vector
     }
 
+    fn calculate_mach_number(&self, velocity: f64, environment: &Environment) -> f64 {
+        // Speed of sound decreases with altitude in a complex way
+        // For simplicity, use a basic approximation based on temperature
+        let speed_of_sound = 20.05 * environment.temperature.sqrt(); // m/s
+        velocity / speed_of_sound
+    }
+
     pub fn calculate_drag(
         &self,
         velocity: Vector2D,
         angle_of_attack: f64,
         environment: &Environment,
     ) -> Vector2D {
-        let dynamic_pressure = self.calculate_dynamic_pressure(velocity, environment);
-        let drag_coefficient_adjusted =
-            self.drag_coefficient * (1.0 + 0.1 * angle_of_attack.abs().sin());
-        let drag_magnitude = dynamic_pressure * self.surface_area * drag_coefficient_adjusted;
+        let speed = velocity.magnitude();
 
-        if velocity.magnitude() > 0.0 {
-            -velocity.normalize() * drag_magnitude
-        } else {
-            Vector2D::new(0.0, 0.0)
+        // Early return if no velocity
+        if speed < 0.001 {
+            return Vector2D::new(0.0, 0.0);
         }
+
+        let mach = self.calculate_mach_number(speed, environment);
+
+        let mach_factor = if mach < 0.8 {
+            1.0
+        } else if mach < 1.2 {
+            1.0 + 5.0 * (mach - 0.8).powi(2)
+        } else {
+            1.0 + (mach - 1.0).sqrt()
+        };
+
+        let angle_effect = 1.0 + angle_of_attack.sin().powi(2);
+        let drag_coefficient_adjusted = self.drag_coefficient * angle_effect * mach_factor;
+
+        let dynamic_pressure = 0.5 * environment.air_density * speed.powi(2);
+
+        let drag_magnitude = dynamic_pressure * self.surface_area * drag_coefficient_adjusted;
+        -velocity.normalize() * drag_magnitude
     }
 
     pub fn calculate_lift(
@@ -52,24 +73,37 @@ impl Aerodynamics {
         angle_of_attack: f64,
         environment: &Environment,
     ) -> Vector2D {
-        let dynamic_pressure = self.calculate_dynamic_pressure(velocity, environment);
-        let lift_magnitude =
-            dynamic_pressure * self.surface_area * self.lift_coefficient * angle_of_attack.sin();
-        let velocity_unit = velocity.normalize();
-
-
-        if velocity.magnitude() > 0.0 {
-            Vector2D::new(-velocity_unit.y, velocity_unit.x) * lift_magnitude
-        } else {
-            Vector2D::new(0.0, 0.0)
-        }
-    }
-
-    fn calculate_dynamic_pressure(&self, velocity: Vector2D, environment: &Environment) -> f64 {
         let speed = velocity.magnitude();
+
+        if speed < 0.001 {
+            return Vector2D::new(0.0, 0.0);
+        }
+
+        let max_lift_angle = 0.26;
+        let stall_angle = 0.35;
+
+        let effective_lift_coefficient = if angle_of_attack.abs() < stall_angle {
+            self.lift_coefficient * (angle_of_attack / max_lift_angle)
+        } else {
+            self.lift_coefficient
+                * (1.0
+                    - 0.8
+                        * ((angle_of_attack.abs() - stall_angle)
+                            / (std::f64::consts::PI / 2.0 - stall_angle)))
+                * angle_of_attack.signum()
+        };
+
+        let effective_lift_coefficient = effective_lift_coefficient.clamp(-1.5, 1.5);
+
         let dynamic_pressure = 0.5 * environment.air_density * speed.powi(2);
 
-        dynamic_pressure
+        let lift_magnitude =
+            dynamic_pressure * self.surface_area * effective_lift_coefficient.abs();
+
+        let velocity_unit = velocity.normalize();
+        Vector2D::new(-velocity_unit.y, velocity_unit.x)
+            * lift_magnitude
+            * effective_lift_coefficient.signum()
     }
 
     pub fn calculate_re_entry_heating(&self, velocity: f64, air_density: f64) -> f64 {
@@ -147,7 +181,7 @@ mod tests {
     fn test_lift_calculation_at_angle_of_attack() {
         let aero = Aerodynamics::new(0.5, 10.0, 0.3);
         let velocity = Vector2D::new(100.0, 0.0);
-        let angle_of_attack = std::f64::consts::PI / 6.0;
+        let angle_of_attack = std::f64::consts::PI / 6.0; // 30 degrees
         let mut environment = create_earth_environment();
         environment.update(
             &Vector2D::new(0.0, 6_371_000.0),
@@ -156,8 +190,27 @@ mod tests {
 
         let lift = aero.calculate_lift(velocity, angle_of_attack, &environment);
 
-        assert_relative_eq!(lift.x, 0.0, epsilon = EPSILON);
-        assert_relative_eq!(lift.y, 9187.591994930208, epsilon = EPSILON);
+        // For horizontal velocity, lift should be purely vertical
+        assert_relative_eq!(lift.x, 0.0, epsilon = 1e-6);
+        assert!(
+            lift.y > 0.0,
+            "Lift should be upward for positive angle of attack"
+        );
+
+        // Test zero angle of attack
+        let zero_lift = aero.calculate_lift(velocity, 0.0, &environment);
+        assert_relative_eq!(zero_lift.magnitude(), 0.0, epsilon = 1e-6);
+
+        // Test negative angle of attack - lift should be downward
+        let negative_aoa = -angle_of_attack;
+        let negative_lift = aero.calculate_lift(velocity, negative_aoa, &environment);
+
+        assert_relative_eq!(negative_lift.x, 0.0, epsilon = 1e-6);
+        assert!(
+            negative_lift.y < 0.0,
+            "Lift should be downward for negative angle of attack"
+        );
+        assert_relative_eq!(negative_lift.magnitude(), lift.magnitude(), epsilon = 1e-6);
     }
 
     #[test]
@@ -172,9 +225,21 @@ mod tests {
         );
 
         let force = aero.calculate_aerodynamic_force(velocity, angle_of_attack, &environment);
+        let drag = aero.calculate_drag(velocity, angle_of_attack, &environment);
+        let lift = aero.calculate_lift(velocity, angle_of_attack, &environment);
 
-        assert_relative_eq!(force.x, -32156.571982255733, epsilon = EPSILON);
-        assert_relative_eq!(force.y, 9187.591994930208, epsilon = EPSILON);
+        let expected_force = drag + lift;
+        assert_relative_eq!(force.x, expected_force.x, epsilon = 1e-6);
+        assert_relative_eq!(force.y, expected_force.y, epsilon = 1e-6);
+
+        assert!(
+            force.x < 0.0,
+            "Drag component should be opposite to velocity"
+        );
+        assert!(
+            force.y > 0.0,
+            "Lift component should be perpendicular to velocity"
+        );
     }
 
     #[test]
@@ -335,6 +400,124 @@ mod tests {
         assert!(
             lift.magnitude() < 1e-12,
             "Lift force in space should be effectively zero"
+        );
+    }
+
+    #[test]
+    fn test_mach_number_calculation() {
+        let aero = Aerodynamics::new(0.5, 10.0, 0.3);
+        let mut environment = create_earth_environment();
+
+        // Update environment to sea level conditions
+        environment.update(
+            &Vector2D::new(0.0, 6_371_000.0),
+            &[environment.current_body.clone()],
+        );
+
+        // At sea level, speed of sound is approximately 340 m/s
+        let expected_speed_of_sound = 20.05 * environment.temperature.sqrt();
+
+        let subsonic_velocity = 300.0;
+        let subsonic_mach = aero.calculate_mach_number(subsonic_velocity, &environment);
+        assert_relative_eq!(
+            subsonic_mach,
+            subsonic_velocity / expected_speed_of_sound,
+            epsilon = 1e-6
+        );
+        assert!(subsonic_mach < 1.0, "Should be subsonic");
+
+        let supersonic_velocity = 1000.0;
+        let supersonic_mach = aero.calculate_mach_number(supersonic_velocity, &environment);
+        assert_relative_eq!(
+            supersonic_mach,
+            supersonic_velocity / expected_speed_of_sound,
+            epsilon = 1e-6
+        );
+        assert!(supersonic_mach > 1.0, "Should be supersonic");
+    }
+
+    #[test]
+    fn test_transonic_drag_increase() {
+        let aero = Aerodynamics::new(0.5, 10.0, 0.3);
+        let mut environment = create_earth_environment();
+
+        environment.update(
+            &Vector2D::new(0.0, 6_371_000.0),
+            &[environment.current_body.clone()],
+        );
+
+        // Calculate speed of sound
+        let speed_of_sound = 20.05 * environment.temperature.sqrt();
+
+        // Create a function to get drag at a specific Mach number
+        let get_drag_at_mach = |mach: f64| -> f64 {
+            let velocity = Vector2D::new(mach * speed_of_sound, 0.0);
+            aero.calculate_drag(velocity, 0.0, &environment).magnitude()
+        };
+
+        // Test drag at different Mach numbers
+        let subsonic_drag = get_drag_at_mach(0.7); // Subsonic
+        let high_subsonic_drag = get_drag_at_mach(0.9); // High subsonic
+        let transonic_drag = get_drag_at_mach(1.0); // Transonic
+
+        // Verify increasing drag with Mach number
+        assert!(
+            high_subsonic_drag > subsonic_drag,
+            "Drag should increase as Mach number increases"
+        );
+
+        assert!(
+            transonic_drag > high_subsonic_drag,
+            "Drag should increase in transonic region"
+        );
+
+        // Calculate percentage increases
+        let subsonic_increase_pct = (high_subsonic_drag - subsonic_drag) / subsonic_drag;
+        let transonic_increase_pct = (transonic_drag - high_subsonic_drag) / high_subsonic_drag;
+
+        println!("Subsonic drag increase: {}%", subsonic_increase_pct * 100.0);
+        println!(
+            "Transonic drag increase: {}%",
+            transonic_increase_pct * 100.0
+        );
+
+        // The transonic increase should be significant
+        assert!(
+            transonic_increase_pct > 0.2,
+            "Transonic drag increase should be significant (>20%)"
+        )
+    }
+
+    #[test]
+    fn test_stall_behavior() {
+        let aero = Aerodynamics::new(0.5, 10.0, 0.3);
+        let mut environment = create_earth_environment();
+
+        environment.update(
+            &Vector2D::new(0.0, 6_371_000.0),
+            &[environment.current_body.clone()],
+        );
+
+        let velocity = Vector2D::new(100.0, 0.0);
+
+        // Check lift at various angles of attack
+        let max_lift_angle = 0.26;
+        let stall_angle = 0.35;
+
+        let max_lift = aero.calculate_lift(velocity, max_lift_angle, &environment);
+
+        let pre_stall_aoa = (max_lift_angle + stall_angle) / 2.0;
+        let pre_stall_lift = aero.calculate_lift(velocity, pre_stall_aoa, &environment);
+
+        let post_stall_aoa = stall_angle + 0.1;
+        let post_stall_lift = aero.calculate_lift(velocity, post_stall_aoa, &environment);
+
+        assert!(
+            post_stall_lift.magnitude() < pre_stall_lift.magnitude(),
+            "Lift should decrease after stall angle: Max lift: {}, Pre-stall: {}, Post-stall: {}",
+            max_lift.magnitude(),
+            pre_stall_lift.magnitude(),
+            post_stall_lift.magnitude()
         );
     }
 }

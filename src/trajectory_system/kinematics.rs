@@ -41,8 +41,8 @@ impl Kinematics {
 
         let acceleration = |position: Vector2D, velocity: Vector2D| {
             let thrust_vector = Vector2D::new(
-                thrust_magnitude * self.orientation.sin(),
                 thrust_magnitude * self.orientation.cos(),
+                thrust_magnitude * self.orientation.sin(),
             );
 
             let gravitational_acceleration =
@@ -67,6 +67,7 @@ impl Kinematics {
     }
 
     pub fn set_mass(&mut self, new_mass: f64) {
+        debug_assert!(new_mass > 0.0, "Mass must be positive");
         self.total_mass = new_mass;
     }
 
@@ -109,11 +110,13 @@ impl Kinematics {
     fn calculate_gravity_from_body(position: Vector2D, body: &CelestialBody) -> Vector2D {
         let r = body.position - position;
         let r_mag = r.magnitude();
-        if r_mag < 1e-6 {
+
+        if r_mag < 1.0 {
             return Vector2D::new(0.0, 0.0);
         }
+
         let g = GRAVITATIONAL_CONSTANT * body.mass / r_mag.powi(2);
-        -r.normalize() * g
+        r.normalize() * g
     }
 
     pub fn get_altitude(&self, celestial_body: &CelestialBody) -> f64 {
@@ -146,6 +149,11 @@ impl Kinematics {
     }
 
     pub fn apply_thrust(&mut self, thrust: f64, delta_time: f64) {
+        if self.total_mass <= 0.0 {
+            debug_assert!(false, "Cannot apply thrust with zero mass");
+            return;
+        }
+
         let thrust_vector = Vector2D::new(
             thrust * self.orientation.cos(),
             thrust * self.orientation.sin(),
@@ -324,8 +332,144 @@ mod tests {
         let position = Vector2D::new(0.0, earth.radius);
         let gravity = Kinematics::calculate_gravity_from_body(position, &earth);
 
-        let expected_gravity = Vector2D::new(0.0, 9.81);
-        assert_relative_eq!(gravity.x, expected_gravity.x, epsilon = 0.01);
-        assert_relative_eq!(gravity.y, expected_gravity.y, epsilon = 0.01);
+        assert_relative_eq!(gravity.x, 0.0, epsilon = 0.01);
+        assert_relative_eq!(gravity.y, -9.81, epsilon = 0.01);
+
+        let position2 = Vector2D::new(earth.radius, 0.0);
+        let gravity2 = Kinematics::calculate_gravity_from_body(position2, &earth);
+
+        assert!(
+            gravity2.x < 0.0,
+            "Gravity should point toward Earth's center"
+        );
+        assert_relative_eq!(gravity2.y, 0.0, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_rk4_integration_accuracy() {
+        // Create kinematics at origin with zero velocity
+        let mut kinematics = Kinematics::new(0.0, Vector2D::new(0.0, 0.0));
+        kinematics.total_mass = 1.0;
+
+        let acceleration_fn = |_: Vector2D, _: Vector2D| Vector2D::new(10.0, 0.0);
+
+        // Analytical solution after 1 second:
+        // Position: x = 0.5*a*t² = 5.0, y = 0
+        // Velocity: v = a*t = 10.0, y = 0
+        let (new_position, new_velocity) = kinematics.rk4_step(1.0, acceleration_fn);
+
+        assert_relative_eq!(new_position.x, 5.0, epsilon = 1e-6);
+        assert_relative_eq!(new_position.y, 0.0, epsilon = 1e-6);
+        assert_relative_eq!(new_velocity.x, 10.0, epsilon = 1e-6);
+        assert_relative_eq!(new_velocity.y, 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_aerodynamic_forces_in_atmosphere() {
+        let mut kinematics = Kinematics::new(0.0, Vector2D::new(0.0, 6_371_000.0));
+        let earth = create_earth();
+        let mut environment = create_mock_environment();
+        let aerodynamics = create_mock_aerodynamics();
+
+        environment.update(&Vector2D::new(0.0, earth.radius), &[earth.clone()]);
+
+        kinematics.velocity = Vector2D::new(1000.0, 0.0);
+        kinematics.total_mass = 10000.0;
+
+        kinematics.update(
+            1.0,
+            0.0, // No thrust
+            10000.0,
+            &aerodynamics,
+            &environment,
+            0.0,
+            &[earth.clone()],
+        );
+
+        assert!(
+            kinematics.velocity.x < 1000.0,
+            "Drag should reduce velocity"
+        );
+
+        kinematics.orientation = 0.1;
+        kinematics.velocity = Vector2D::new(1000.0, 0.0);
+
+        kinematics.update(
+            1.0,
+            0.0, // No thrust
+            10000.0,
+            &aerodynamics,
+            &environment,
+            0.0,
+            &[earth],
+        );
+
+        assert!(
+            kinematics.velocity.y != 0.0,
+            "Lift should generate vertical motion"
+        );
+    }
+
+    #[test]
+    fn test_orbital_mechanics() {
+        let earth = create_earth();
+        let mut environment = create_mock_environment();
+        let aerodynamics = create_mock_aerodynamics();
+
+        let orbit_altitude = 200_000.0;
+        let orbit_radius = earth.radius + orbit_altitude;
+        let position = Vector2D::new(0.0, orbit_radius);
+
+        let mut kinematics = Kinematics::new(0.0, position);
+
+        let orbital_velocity = kinematics.calculate_orbital_velocity(&earth);
+
+        kinematics.velocity = Vector2D::new(orbital_velocity, 0.0);
+        kinematics.total_mass = 10000.0;
+
+        environment.update(&position, &[earth.clone()]);
+
+        for _ in 0..100 {
+            kinematics.update(
+                10.0,
+                0.0,
+                10000.0,
+                &aerodynamics,
+                &environment,
+                0.0,
+                &[earth.clone()],
+            );
+        }
+
+        let new_altitude = (kinematics.position - earth.position).magnitude() - earth.radius;
+        assert_relative_eq!(new_altitude, orbit_altitude, epsilon = 100.0);
+
+        assert_relative_eq!(
+            kinematics.velocity.magnitude(),
+            orbital_velocity,
+            epsilon = 1.0
+        );
+    }
+
+    #[test]
+    fn test_orientation_change_limits() {
+        let mut kinematics = Kinematics::new(0.0, Vector2D::new(0.0, 0.0));
+
+        let max_rate = 0.1;
+        let delta_time = 1.0;
+        let large_rotation = 0.5;
+
+        kinematics.apply_rotation(large_rotation, delta_time);
+
+        assert_relative_eq!(kinematics.orientation, max_rate, epsilon = 1e-6);
+
+        kinematics.orientation = 0.0;
+        kinematics.apply_rotation(-large_rotation, delta_time);
+
+        assert_relative_eq!(
+            kinematics.orientation,
+            2.0 * std::f64::consts::PI - max_rate,
+            epsilon = 1e-6
+        );
     }
 }

@@ -1,5 +1,6 @@
 pub mod constants;
 pub mod control;
+pub mod errors;
 pub mod telemetry_system;
 pub mod trajectory_system;
 pub mod utils;

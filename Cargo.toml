@@ -16,6 +16,8 @@ path = "src/main.rs"
 # rapier2d = "0.13.0"
 # ggez = "0.7.0"
 rand = "0.8.5"
+thiserror = "1.0.30"
+
 
 [dev-dependencies]
 approx = "0.5"
